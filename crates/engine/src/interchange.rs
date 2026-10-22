@@ -30,8 +30,8 @@ fn is_file_media(item: &filmcraft_project::ProjectItem) -> bool {
 fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
     let original = Path::new(path);
     let stem = original.file_stem().ok_or_else(|| EngineError::Other(format!("{path}: missing audio file name")))?;
-    for number in 1..=1_000 {
-        let candidate = if number == 1 {
+    let candidate_path = |number| {
+        if number == 1 {
             original.to_path_buf()
         } else {
             let mut name = stem.to_os_string();
@@ -41,11 +41,25 @@ fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
                 name.push(extension);
             }
             original.with_file_name(name)
-        };
+        }
+    };
+    for number in 1..=1_000 {
+        let candidate = candidate_path(number);
+        let candidate_text = candidate.to_string_lossy();
+        if s.services.existing_file_matches(&candidate_text, wav).unwrap_or(false) {
+            return Ok(candidate_text.into_owned());
+        }
+    }
+    for number in 1..=1_000 {
+        let candidate = candidate_path(number);
         let candidate_text = candidate.to_string_lossy();
         match s.services.write_file_new(&candidate_text, wav) {
             Ok(()) => return Ok(candidate_text.into_owned()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if s.services.existing_file_matches(&candidate_text, wav).unwrap_or(false) {
+                    return Ok(candidate_text.into_owned());
+                }
+            }
             Err(e) => return Err(EngineError::Other(format!("{candidate_text}: {e}"))),
         }
     }
@@ -217,6 +231,10 @@ mod embedded_audio_tests {
             files.insert(path.to_owned(), data.to_vec());
             Ok(())
         }
+
+        fn existing_file_matches(&self, path: &str, data: &[u8]) -> io::Result<bool> {
+            Ok(self.0.lock().unwrap().get(path).is_some_and(|bytes| bytes == data))
+        }
     }
 
     #[test]
@@ -231,5 +249,9 @@ mod embedded_audio_tests {
         assert_eq!(stored["/files/cut Audio.wav"], b"first");
         assert_eq!(stored["/files/cut Audio (2).wav"], b"second");
         assert_eq!(stored["/files/cut Audio (3).wav"], b"new audio");
+        drop(stored);
+        let again = write_embedded_audio(&session, "/files/cut Audio.wav", b"new audio").unwrap();
+        assert_eq!(again, path);
+        assert_eq!(files.0.lock().unwrap().len(), 3);
     }
 }

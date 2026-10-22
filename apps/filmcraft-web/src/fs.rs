@@ -370,6 +370,13 @@ impl Services for WebServices {
         Ok(())
     }
 
+    fn existing_file_matches(&self, path: &str, data: &[u8]) -> io::Result<bool> {
+        if path.starts_with("/opfs/") {
+            return Ok(false);
+        }
+        Ok(FS.with(|fs| matches!(fs.borrow().entries.get(path), Some(Entry::Mem(bytes)) if bytes.as_ref() == data)))
+    }
+
     fn file_size(&self, path: &str) -> io::Result<u64> {
         Self::entry_reader(path).map(|r| r.len())
     }
@@ -471,6 +478,9 @@ mod exclusive_write_tests {
         });
         assert_eq!(host.write_file_new(existing, b"replacement").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(host.read_file(existing).unwrap(), b"original");
+        assert!(!host.existing_file_matches(existing, b"originaX").unwrap());
+        assert!(host.existing_file_matches(existing, b"original").unwrap());
+        assert!(!host.existing_file_matches("/opfs/media/new.wav", b"new").unwrap());
         host.write_file_new(fresh, b"new").unwrap();
         assert_eq!(host.read_file(fresh).unwrap(), b"new");
         assert_eq!(host.write_file_new(fresh, b"again").unwrap_err().kind(), io::ErrorKind::AlreadyExists);

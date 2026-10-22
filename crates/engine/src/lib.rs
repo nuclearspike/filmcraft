@@ -110,6 +110,11 @@ pub trait Services: Send + Sync {
     fn write_file_new(&self, _path: &str, _data: &[u8]) -> std::io::Result<()> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "exclusive file creation is unavailable on this host"))
     }
+    /// Whether an occupied regular file has exactly these bytes. Symlinks must return false.
+    /// Hosts that cannot verify return false.
+    fn existing_file_matches(&self, _path: &str, _data: &[u8]) -> std::io::Result<bool> {
+        Ok(false)
+    }
     /// Size of a file in bytes (an error when it is missing). Hosts should override this: the
     /// default reads the whole file.
     fn file_size(&self, path: &str) -> std::io::Result<u64> {
@@ -159,6 +164,33 @@ pub trait Services: Send + Sync {
 
 /// Native filesystem services.
 pub struct FsServices;
+
+fn same_file_snapshot(first: &std::fs::Metadata, second: &std::fs::Metadata) -> bool {
+    if !first.file_type().is_file() || !second.file_type().is_file() || first.len() != second.len() {
+        return false;
+    }
+    let (Ok(first_modified), Ok(second_modified)) = (first.modified(), second.modified()) else {
+        return false;
+    };
+    if first_modified != second_modified {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        first.dev() == second.dev() && first.ino() == second.ino() && first.ctime() == second.ctime() && first.ctime_nsec() == second.ctime_nsec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        first.creation_time() == second.creation_time() && first.last_write_time() == second.last_write_time()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 impl Services for FsServices {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         std::fs::read(path)
@@ -183,6 +215,40 @@ impl Services for FsServices {
             Err(e) => return Err(e),
         }
         filmcraft_format::atomic_write_new(path, data)
+    }
+    fn existing_file_matches(&self, path: &str, data: &[u8]) -> std::io::Result<bool> {
+        use std::io::Read;
+
+        let before = std::fs::symlink_metadata(path)?;
+        let Ok(expected_len) = u64::try_from(data.len()) else { return Ok(false) };
+        if !before.file_type().is_file() || before.len() != expected_len {
+            return Ok(false);
+        }
+        #[cfg(windows)]
+        let mut file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path)?
+        };
+        #[cfg(not(windows))]
+        let mut file = std::fs::File::open(path)?;
+        if !same_file_snapshot(&before, &file.metadata()?) {
+            return Ok(false);
+        }
+        let mut buffer = [0_u8; 8192];
+        for chunk in data.chunks(buffer.len()) {
+            file.read_exact(&mut buffer[..chunk.len()])?;
+            if buffer[..chunk.len()] != *chunk {
+                return Ok(false);
+            }
+        }
+        let mut extra = [0_u8];
+        if file.read(&mut extra)? != 0 {
+            return Ok(false);
+        }
+        let opened_after = file.metadata()?;
+        let pathname_after = std::fs::symlink_metadata(path)?;
+        Ok(same_file_snapshot(&before, &opened_after) && same_file_snapshot(&opened_after, &pathname_after))
     }
     fn file_size(&self, path: &str) -> std::io::Result<u64> {
         let m = std::fs::metadata(path)?;
