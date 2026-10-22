@@ -393,6 +393,24 @@ impl Services for WebServices {
         true
     }
 
+    fn list_dir_bounded(&self, dir: &str, max_entries: usize, max_bytes: usize) -> Option<io::Result<Vec<String>>> {
+        let prefix = if dir.ends_with('/') { dir.to_string() } else { format!("{dir}/") };
+        Some(FS.with(|fs| {
+            let fs = fs.borrow();
+            let mut names = Vec::new();
+            let mut bytes = 0_usize;
+            for path in fs.entries.keys() {
+                let Some(name) = path.strip_prefix(&prefix).filter(|name| !name.is_empty() && !name.contains('/')) else { continue };
+                bytes = bytes.checked_add(name.len()).ok_or_else(|| io::Error::other("directory listing byte limit exceeded"))?;
+                if names.len() >= max_entries || bytes > max_bytes {
+                    return Err(io::Error::other("directory listing limit exceeded"));
+                }
+                names.push(name.to_owned());
+            }
+            Ok(names)
+        }))
+    }
+
     /// The Media Browser lists the virtual file table: picked and dropped files under `/files`.
     fn list_entries(&self, dir: &str) -> Option<io::Result<Vec<filmcraft_engine::media_browser::DirEntry>>> {
         use filmcraft_engine::media_browser::DirEntry;

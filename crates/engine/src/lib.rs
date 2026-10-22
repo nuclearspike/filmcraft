@@ -136,6 +136,11 @@ pub trait Services: Send + Sync {
     fn list_dir(&self, _dir: &str) -> Option<std::io::Result<Vec<String>>> {
         None
     }
+    /// Direct child names within both limits; return an error rather than a partial listing.
+    /// Hosts without bounded directory listing leave the importer to probe candidate paths.
+    fn list_dir_bounded(&self, _dir: &str, _max_entries: usize, _max_bytes: usize) -> Option<std::io::Result<Vec<String>>> {
+        None
+    }
     /// A loader the media pool keeps for reading files later (image sequence frames on demand).
     /// `None`: the frames are read when the sequence is opened.
     fn file_loader(&self) -> Option<filmcraft_media::sequence::FrameLoader> {
@@ -257,6 +262,22 @@ impl Services for FsServices {
     fn list_dir(&self, dir: &str) -> Option<std::io::Result<Vec<String>>> {
         let dir = if dir.is_empty() { "." } else { dir };
         Some(std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()))
+    }
+    fn list_dir_bounded(&self, dir: &str, max_entries: usize, max_bytes: usize) -> Option<std::io::Result<Vec<String>>> {
+        let dir = if dir.is_empty() { "." } else { dir };
+        Some((|| {
+            let mut names = Vec::new();
+            let mut bytes = 0_usize;
+            for entry in std::fs::read_dir(dir)? {
+                let name = entry?.file_name().into_string().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 directory entry"))?;
+                bytes = bytes.checked_add(name.len()).ok_or_else(|| std::io::Error::other("directory listing byte limit exceeded"))?;
+                if names.len() >= max_entries || bytes > max_bytes {
+                    return Err(std::io::Error::other("directory listing limit exceeded"));
+                }
+                names.push(name);
+            }
+            Ok(names)
+        })())
     }
     fn file_loader(&self) -> Option<filmcraft_media::sequence::FrameLoader> {
         Some(std::sync::Arc::new(|p: &str| std::fs::read(p)))
