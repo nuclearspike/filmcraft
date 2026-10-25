@@ -69,7 +69,8 @@ and [November 2006 Candidate Recommendation](https://www.w3.org/TR/2006/CR-ttaf1
 `2006/10` is the namespace date, not a specification publication date.
 
 The inline text collector collapses XML whitespace and walks nested spans iteratively. Named-style
-chaining and `xml:space="preserve"` are not supported. Stack safety for the separate recursive time-container walk is tracked by #2049.
+chaining and `xml:space="preserve"` are not supported. XML nesting is capped at 128 elements before
+parsing; this also bounds the separate recursive time-container walk.
 
 ### SCC writer
 
@@ -104,7 +105,7 @@ implementation's code was consulted.
 
 - Unit tests per module (timestamps, decoding, sloppy SRT, WebVTT blocks and voices, CEA-608
   tables, PAC round trips, known SCC pop-on and roll-up streams, layout).
-- `tests/roundtrip.rs`: property tests — SRT (also with BOM + CRLF), WebVTT (ids, speakers,
+- `tests/it/roundtrip.rs`: property tests — SRT (also with BOM + CRLF), WebVTT (ids, speakers,
   settings, STYLE blocks), SCC and MCC (drop-frame and non-drop, gaps and back-to-back captions;
   MCC also through CEA-708 alone), EBU STL (25 and 29.97 fps, accents, extension blocks), TTML
   (23.976 / 25 / 29.97 / 59.94, ids, speakers) round-trip frame-exactly; DFXP round-trips after
