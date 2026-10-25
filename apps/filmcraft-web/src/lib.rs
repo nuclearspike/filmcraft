@@ -268,10 +268,13 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     };
     let recovered = match recovered_result {
         Ok(recovered) => recovered,
-        Err(error) => match recovery::load_raw_snapshot_blob().await {
-            Ok(Some(blob)) => Some(StartupRecovery::Unreadable(error, blob)),
-            Ok(None) => Some(StartupRecovery::Unavailable(error)),
-            Err(fallback_error) => Some(StartupRecovery::Unavailable(format!("{error}; {fallback_error}"))),
+        Err(error) => match recovery_policy::recovery_read_fallback(recovery::load_raw_snapshot_blob().await) {
+            recovery_policy::RecoveryReadFallback::Hold(blob) => Some(StartupRecovery::Unreadable(error, blob)),
+            recovery_policy::RecoveryReadFallback::Proceed => {
+                log::warn!("browser recovery metadata ignored because no snapshot exists: {error}");
+                None
+            }
+            recovery_policy::RecoveryReadFallback::Unavailable(fallback_error) => Some(StartupRecovery::Unavailable(format!("{error}; {fallback_error}"))),
         },
     };
     webcodecs::probe().await;

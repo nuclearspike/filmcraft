@@ -73,9 +73,11 @@ fn a_file_still_being_written_is_tried_again() {
     let result = refresh(&mut s);
     assert_eq!(result["refreshed"], json!([]));
     assert!(result["errors"][0].as_str().is_some_and(|error| error.contains("a.mov")));
+    assert_eq!(s.media.offline_status(items[0]).map(|status| status.reason), Some(filmcraft_render::offline::OfflineReason::Unreadable));
     std::thread::sleep(std::time::Duration::from_millis(30));
     std::fs::write(&a, &bytes).unwrap();
     assert_eq!(refresh(&mut s), json!({"refreshed": [items[0].0]}));
+    assert!(s.media.offline_status(items[0]).is_none());
 }
 
 #[test]

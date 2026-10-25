@@ -1,5 +1,5 @@
 //! When the web recovery snapshot is written or marked clean (pure, so it is tested natively in
-//! `tests/recovery_policy.rs`; the OPFS side lives in [`crate::recovery`]).
+//! `tests/it/recovery_policy.rs`; the OPFS side lives in [`crate::recovery`]).
 //!
 //! - A dirty project is snapshotted at most every [`INTERVAL_S`] seconds, once per revision. A write
 //!   that fails is retried after the interval, without waiting for another edit (#197).
@@ -34,6 +34,23 @@ pub enum StartupRecoveryMode {
 
 pub fn startup_recovery_mode(skip_recovery: bool) -> StartupRecoveryMode {
     if skip_recovery { StartupRecoveryMode::HoldForDownload } else { StartupRecoveryMode::Open }
+}
+
+/// Preserve an existing raw snapshot after a metadata/read error, but do not hold recovery
+/// when the raw lookup confirms that no snapshot exists.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecoveryReadFallback<T> {
+    Proceed,
+    Hold(T),
+    Unavailable(String),
+}
+
+pub fn recovery_read_fallback<T>(raw: Result<Option<T>, String>) -> RecoveryReadFallback<T> {
+    match raw {
+        Ok(Some(snapshot)) => RecoveryReadFallback::Hold(snapshot),
+        Ok(None) => RecoveryReadFallback::Proceed,
+        Err(error) => RecoveryReadFallback::Unavailable(error),
+    }
 }
 
 /// Keep recovery metadata small without changing the project name stored in the snapshot.

@@ -59,13 +59,13 @@ async function js(expression) {
   return result.result.value;
 }
 
-async function until(check, timeoutMs = 15000) {
+async function until(check, timeoutMs = 15000, message = "browser recovery test timed out") {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
     if (await check()) return;
     await sleep(100);
   }
-  throw new Error("browser recovery test timed out");
+  throw new Error(message);
 }
 
 try {
@@ -76,6 +76,32 @@ try {
   await send("Page.navigate", { url });
   await until(async () => await js("!!window.filmcraftLoad?.readyMs"));
   assert.equal(await js("window.filmcraftLoad.fatal ?? null"), null);
+
+  // A crash after the first dirty-meta write can leave no snapshot to preserve.
+  await js(`(async () => {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("recovery", {create:true});
+    try { await dir.removeEntry("snapshot.fcproj"); } catch (error) {
+      if (error.name !== "NotFoundError") throw error;
+    }
+    const file = await dir.getFileHandle("meta.json", {create:true});
+    const writer = await file.createWritable();
+    await writer.write(JSON.stringify({dirty:true,name:"Interrupted first snapshot",revision:7,time:1}));
+    await writer.close();
+  })()`);
+  const orphanOrigin = await js("performance.timeOrigin");
+  await send("Page.reload", { ignoreCache: true });
+  await until(async () => await js(`performance.timeOrigin !== ${orphanOrigin} && !!window.filmcraftLoad?.readyMs`));
+  await sleep(800);
+  assert.equal(await js("window.filmcraftLoad.fatal ?? null"), null);
+  await js("window.filmcraft.inspect()");
+  assert.deepEqual(await js("window.filmcraft.request(\'ui.elements\',{prefix:\'recovery.\'})"), []);
+  await js("window.filmcraft.execute(\'file.newSequence\',{name:\'Autosave after missing snapshot\'})");
+  await until(async () => await js(`(async () => {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("recovery");
+    try { return (await (await dir.getFileHandle("snapshot.fcproj")).getFile()).size > 0; }
+    catch (error) { if (error.name === "NotFoundError") return false; throw error; }
+  })()`), 15000, "metadata-only startup must resume autosave");
+  console.log("metadata-only startup resumes autosave: PASS");
 
   await js(`(async () => {
     const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("recovery", {create:true});

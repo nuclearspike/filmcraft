@@ -20,6 +20,7 @@ use crate::recovery_policy::{Action, Policy};
 const SNAPSHOT: &str = "recovery/snapshot.fcproj";
 const META: &str = "recovery/meta.json";
 const MAX_META_BYTES: u64 = 1 << 20;
+// Match fs::WHOLE_FILE_MAX: the normal browser file.open byte limit.
 const MAX_SNAPSHOT_BYTES: u64 = 256 << 20;
 /// Media larger than this are not copied to OPFS.
 const KEEP_MAX: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
