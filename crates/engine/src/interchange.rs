@@ -1,7 +1,5 @@
 //! Interchange documents (CMX 3600 EDL, FCP7 XML, FCPXML, OTIO, AAF, OMF) ↔ the session's project.
 
-use std::path::Path;
-
 use serde_json::{Value, json};
 
 use filmcraft_interchange::{ExportOptions, Format, ImportOptions};
@@ -26,57 +24,49 @@ fn is_file_media(item: &filmcraft_project::ProjectItem) -> bool {
     matches!(&item.kind, ItemKind::Media(m) if matches!(m.media, MediaRef::File { .. }))
 }
 
-/// Write embedded audio without replacing an occupied path; return the path used.
+/// Write embedded audio or reuse an identical regular file; never replace an occupied path.
+/// Return the path used. A numbered
+/// name changes only the file name: the folder keeps its separators as written (`/` or `\`).
 fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
-    let original = Path::new(path);
-    let stem = original.file_stem().ok_or_else(|| EngineError::Other(format!("{path}: missing audio file name")))?;
-    let candidate_path = |number| {
-        if number == 1 {
-            original.to_path_buf()
-        } else {
-            let mut name = stem.to_os_string();
-            name.push(format!(" ({number})"));
-            if let Some(extension) = original.extension() {
-                name.push(".");
-                name.push(extension);
-            }
-            original.with_file_name(name)
-        }
+    let (folder, name) = path.split_at(path.rfind(['/', '\\']).map_or(0, |i| i + 1));
+    if matches!(name, "" | "." | "..") {
+        return Err(EngineError::Other(format!("{path}: missing audio file name")));
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
     };
+    let candidate_name = |number| if number == 1 { name.to_owned() } else { format!("{stem} ({number}){extension}") };
     const MAX_LISTED_ENTRIES: usize = 10_000;
     const MAX_LISTED_BYTES: usize = 1_000_000;
-    let dir = original.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let occupied = match s.services.list_dir_bounded(&dir.to_string_lossy(), MAX_LISTED_ENTRIES, MAX_LISTED_BYTES) {
-        Some(Ok(names)) if original.file_name().and_then(|name| name.to_str()).is_some_and(str::is_ascii) && names.iter().all(|name| name.is_ascii()) => {
+    let dir = if folder.is_empty() { "." } else { folder };
+    let occupied = match s.services.list_dir_bounded(dir, MAX_LISTED_ENTRIES, MAX_LISTED_BYTES) {
+        Some(Ok(names)) if name.is_ascii() && names.iter().all(|name| name.is_ascii()) => {
             Some(names.into_iter().map(|name| name.to_ascii_lowercase()).collect::<std::collections::HashSet<_>>())
         }
         Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Some(std::collections::HashSet::new()),
         _ => None,
     };
     for number in 1..=1_000 {
-        let candidate = candidate_path(number);
-        if occupied
-            .as_ref()
-            .is_some_and(|names| candidate.file_name().and_then(|name| name.to_str()).is_some_and(|name| !names.contains(&name.to_ascii_lowercase())))
-        {
+        let name = candidate_name(number);
+        if occupied.as_ref().is_some_and(|names| !names.contains(&name.to_ascii_lowercase())) {
             continue;
         }
-        let candidate_text = candidate.to_string_lossy();
-        if s.services.existing_file_matches(&candidate_text, wav).unwrap_or(false) {
-            return Ok(candidate_text.into_owned());
+        let candidate = format!("{folder}{name}");
+        if s.services.existing_file_matches(&candidate, wav).unwrap_or(false) {
+            return Ok(candidate);
         }
     }
     for number in 1..=1_000 {
-        let candidate = candidate_path(number);
-        let candidate_text = candidate.to_string_lossy();
-        match s.services.write_file_new(&candidate_text, wav) {
-            Ok(()) => return Ok(candidate_text.into_owned()),
+        let candidate = format!("{folder}{}", candidate_name(number));
+        match s.services.write_file_new(&candidate, wav) {
+            Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if s.services.existing_file_matches(&candidate_text, wav).unwrap_or(false) {
-                    return Ok(candidate_text.into_owned());
+                if s.services.existing_file_matches(&candidate, wav).unwrap_or(false) {
+                    return Ok(candidate);
                 }
             }
-            Err(e) => return Err(EngineError::Other(format!("{candidate_text}: {e}"))),
+            Err(e) => return Err(EngineError::Other(format!("{candidate}: {e}"))),
         }
     }
     Err(EngineError::Other(format!("{path}: no unused embedded-audio filename after 1000 attempts")))
@@ -111,6 +101,11 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
         }
         _ => filmcraft_interchange::import_with(bytes, format, &opts).map_err(|e| EngineError::Other(format!("{path}: {e}")))?,
     };
+    for item in fragment.project.items.values() {
+        if let ItemKind::Sequence(sequence) = &item.kind {
+            sequence.settings.validate().map_err(|e| EngineError::Other(format!("{path}: invalid imported sequence settings: {e}")))?;
+        }
+    }
     let before: std::collections::HashSet<ItemId> = s.project.items.keys().copied().collect();
     let name = opts.name.clone().unwrap_or_else(|| format.name().to_string());
     let seqs = s.edit(&format!("Import {name}"), |proj, _| {
@@ -263,11 +258,17 @@ mod embedded_audio_tests {
 
         fn list_dir_bounded(&self, dir: &str, max_entries: usize, max_bytes: usize) -> Option<io::Result<Vec<String>>> {
             Some((|| {
-                let prefix = format!("{}/", dir.trim_end_matches('/'));
+                let prefix = if dir == "." {
+                    String::new()
+                } else if dir.ends_with(['/', '\\']) {
+                    dir.to_owned()
+                } else {
+                    format!("{dir}/")
+                };
                 let mut names = Vec::new();
                 let mut bytes = 0_usize;
                 for path in self.0.lock().unwrap().keys() {
-                    let Some(name) = path.strip_prefix(&prefix).filter(|name| !name.is_empty() && !name.contains('/')) else { continue };
+                    let Some(name) = path.strip_prefix(&prefix).filter(|name| !name.is_empty() && !name.contains(['/', '\\'])) else { continue };
                     bytes = bytes.checked_add(name.len()).ok_or_else(|| io::Error::other("directory listing byte limit exceeded"))?;
                     if names.len() >= max_entries || bytes > max_bytes {
                         return Err(io::Error::other("directory listing limit exceeded"));
@@ -347,5 +348,24 @@ mod embedded_audio_tests {
         let again = write_embedded_audio(&session, "/files/cut Audio.wav", b"new audio").unwrap();
         assert_eq!(again, path);
         assert_eq!(files.0.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn numbered_names_keep_the_path_separators() {
+        for path in ["C:/files/cut Audio.wav", "C:\\files\\cut Audio.wav"] {
+            let files = Arc::new(VirtualFiles::default());
+            files.0.lock().unwrap().insert(path.into(), b"first".to_vec());
+            let session = Session::new(files.clone());
+            let numbered = write_embedded_audio(&session, path, b"new audio").unwrap();
+            assert_eq!(numbered, path.replace("cut Audio.wav", "cut Audio (2).wav"));
+            assert_eq!(files.0.lock().unwrap()[path], b"first");
+            assert_eq!(write_embedded_audio(&session, path, b"new audio").unwrap(), numbered);
+            let later = path.replace("cut Audio.wav", "cut Audio (9).wav");
+            files.0.lock().unwrap().insert(later.clone(), b"later match".to_vec());
+            files.1.store(0, Ordering::Relaxed);
+            assert_eq!(write_embedded_audio(&session, path, b"later match").unwrap(), later);
+            assert_eq!(files.1.load(Ordering::Relaxed), 3, "only the three occupied names need comparison");
+            assert_eq!(files.0.lock().unwrap().len(), 3, "the gap before (9) stays empty");
+        }
     }
 }

@@ -144,6 +144,18 @@ fn embedded_aaf_and_omf_import_leave_existing_media_files_intact() {
             let third_path = path_of(&s, imported_again.audio_tracks[0].items[0].item);
             assert_eq!(third_path, new_path, "{extension}: symlink collision should reuse the existing extracted WAV");
             assert!(!std::path::Path::new(&duplicate_path).exists(), "{extension}: symlink collision left a duplicate WAV");
+
+            // Force the exclusive-create path past the symlink and an occupied numbered file.
+            std::fs::write(&protected, &original).unwrap();
+            std::fs::write(&new_path, &original).unwrap();
+            let again = s.execute("file.import", json!({"paths": [path.to_string_lossy()]})).unwrap();
+            let imported_again = s.project.sequence(imported_seq(&again)).unwrap();
+            let fresh_path = path_of(&s, imported_again.audio_tracks[0].items[0].item);
+            assert_eq!(fresh_path, duplicate_path, "{extension}: symlink collision should create a fresh numbered WAV");
+            assert_eq!(std::fs::read(&fresh_path).unwrap(), first.wav, "{extension}: fresh extraction differs");
+            assert_eq!(std::fs::read(&protected).unwrap(), original, "{extension}: write followed the symlink");
+            assert_eq!(std::fs::read(&new_path).unwrap(), original, "{extension}: write replaced the occupied numbered file");
+            assert!(std::fs::symlink_metadata(&first.path).unwrap().file_type().is_symlink(), "{extension}: symlink was replaced");
         }
         let _ = std::fs::remove_dir_all(dir);
     }
