@@ -198,6 +198,14 @@ fn menu_targets(selection: &[ItemId], id: ItemId) -> Vec<ItemId> {
     if selection.contains(&id) { selection.to_vec() } else { vec![id] }
 }
 
+/// Keep the selection's recorded order even when the view is sorted differently or the drag
+/// starts from a later selected item. Organization drops retain selected bins too.
+fn project_drag_payload(app: &FilmcraftApp, anchor: ItemId) -> crate::panels::ItemDrag {
+    let selected = &app.session.state.project_selection;
+    let selection = if selected.contains(&anchor) { selected.clone() } else { vec![anchor] };
+    crate::panels::ItemDrag::capture(anchor, selection, &app.session.project)
+}
+
 /// Click / double-click / drag / context menu of an item (row, card).
 pub(super) struct ItemInteraction<'a> {
     view: &'a View,
@@ -234,7 +242,7 @@ pub(super) fn item_interactions(app: &mut FilmcraftApp, ui: &egui::Ui, actions: 
         }
     }
     if drag && resp.drag_started_by(egui::PointerButton::Primary) {
-        crate::panels::start_drag_item(ui, id);
+        crate::panels::start_drag_items(ui, project_drag_payload(app, id));
     }
     if menu {
         resp.context_menu(|ui| item_menu(app, ui, id, kind, actions));
@@ -402,9 +410,8 @@ pub fn clear_params(selection: &[filmcraft_project::ItemId], selected_bin: Optio
 /// Drop project items dragged onto a bin: move them (the selection when the dragged item is in it).
 /// A dragged bin nests in it, unless that would put the bin inside itself.
 fn accept_bin_drop(app: &FilmcraftApp, ui: &egui::Ui, r: Rect, bin: u64, actions: &mut Actions) -> bool {
-    let items: Vec<u64> = if let Some(item) = crate::panels::dragged_project_item(ui) {
-        let sel = &app.session.state.project_selection;
-        if sel.contains(&item) { sel.iter().map(|i| i.0).collect() } else { vec![item.0] }
+    let items: Vec<u64> = if crate::panels::dragged_project_item(ui).is_some() {
+        crate::panels::dragged_selection(ui).iter().map(|i| i.0).collect()
     } else if let Some(dragged) = crate::panels::dragged_bin(ui) {
         let root = &app.session.project.root;
         if root.find_bin(BinId(dragged)).is_none_or(|d| d.find_bin(BinId(bin)).is_some()) {
@@ -1081,6 +1088,7 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
     let mut cards: Vec<Card> = pp::freeform_layout(&app.session.project, Some(v.bin), &opts, rect.width());
     cards.retain(|c| matches_filter(app, ItemId(c.item), filter));
     let drag_key = egui::Id::unique((&v.prefix, "ff-drag"));
+    let selection_key = drag_key.with("selection");
     // (dragged item, offset so far)
     let dragging: Option<(u64, egui::Vec2)> = ui.ctx().data(|d| d.get_temp(drag_key));
     let sel: Vec<u64> = app.session.state.project_selection.iter().map(|i| i.0).collect();
@@ -1158,13 +1166,20 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
                 actions,
                 ItemInteraction { view: v, response: &resp, item: ItemId(c.item), kind: &kind, allow_drag: false, allow_menu: false },
             );
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                let items = project_drag_payload(app, ItemId(c.item));
+                ui.ctx().data_mut(|d| d.insert_temp(selection_key, items));
+            }
             // Escape puts the cards back and drops nothing until the button comes up (#580); egui
             // also ends the drag on Escape, so it arrives as a stop as often as during the drag
             let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
             // only the primary button moves cards: a middle-button drag pans the canvas (#579)
             let (dragged, stopped) = (resp.dragged_by(egui::PointerButton::Primary), resp.drag_stopped_by(egui::PointerButton::Primary));
             if (dragged || stopped) && (escape || crate::panels::drag_cancelled(ui)) {
-                ui.ctx().data_mut(|d| d.remove::<(u64, egui::Vec2)>(drag_key));
+                ui.ctx().data_mut(|d| {
+                    d.remove::<(u64, egui::Vec2)>(drag_key);
+                    d.remove::<crate::panels::ItemDrag>(selection_key);
+                });
                 crate::panels::cancel_drag(ui);
             } else if dragged {
                 let total = dragging.filter(|d| d.0 == c.item).map(|d| d.1).unwrap_or_default() + resp.drag_delta();
@@ -1173,8 +1188,9 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
                 if let Some(p) = ui.ctx().pointer_latest_pos()
                     && !rect.contains(p)
                     && crate::panels::dragged_project_item(ui).is_none()
+                    && let Some(drag) = ui.ctx().data(|d| d.get_temp::<crate::panels::ItemDrag>(selection_key))
                 {
-                    crate::panels::start_drag_item(ui, ItemId(c.item));
+                    crate::panels::start_drag_items(ui, drag);
                 }
             }
             if stopped && !crate::panels::drag_cancelled(ui) {
@@ -1184,7 +1200,10 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
         }
         marquee(app, ui, v, &bg, canvas.min, actions);
         if let Some((item, off)) = released {
-            ui.ctx().data_mut(|d| d.remove::<(u64, egui::Vec2)>(drag_key));
+            ui.ctx().data_mut(|d| {
+                d.remove::<(u64, egui::Vec2)>(drag_key);
+                d.remove::<crate::panels::ItemDrag>(selection_key);
+            });
             let inside = ui.ctx().pointer_latest_pos().is_some_and(|p| rect.contains(p));
             if inside && off.length() > 1.0 {
                 let c = cards.iter().find(|c| c.item == item).cloned();
