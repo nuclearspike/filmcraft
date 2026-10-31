@@ -12,7 +12,7 @@
 use std::sync::mpsc::{Sender, channel};
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use filmcraft_engine::Session;
 use filmcraft_engine::project_panel::{FREEFORM_POS, FREEFORM_STACK, ViewMode};
 use filmcraft_project::{BinEntry, ItemId};
@@ -545,6 +545,8 @@ fn metadata_display_dialog_and_view_presets() {
     assert_eq!(cols[0], "Name");
     assert_eq!(cols[1], "Label", "{cols:?}");
     assert!(cols.contains(&"Video Usage".to_string()) && !cols.contains(&"Tape Name".to_string()));
+    d.frames(2);
+    d.ok("ui.scroll", json!({"id": "panel.Project", "dx": -80, "dy": 0}));
     d.frames(2);
     assert!(d.has("project.list.header.Label") && d.has("project.list.header.Video Usage"));
 
@@ -1221,6 +1223,13 @@ fn placed_imports(d: &mut Driver) -> Vec<(String, i64, i64)> {
     clips
 }
 
+fn assert_selection_badges(d: &mut Driver, ordered: &[ItemId]) {
+    d.frames(2);
+    for (index, id) in ordered.iter().enumerate() {
+        assert_eq!(d.label(&format!("project.item.{}.selectionOrder", id.0)), (index + 1).to_string(), "badge for {id:?}");
+    }
+}
+
 #[test]
 fn imported_click_order_survives_sort_view_changes_and_a_nonfirst_drag_anchor() {
     for view in ["list", "icon", "freeform"] {
@@ -1245,6 +1254,7 @@ fn imported_click_order_survives_sort_view_changes_and_a_nonfirst_drag_anchor() 
                 d.ok("ui.click", json!({"id": format!("project.item.{}", id.0), "modifiers": {"command": index > 0}}));
                 d.frames(2);
                 assert_eq!(d.app().session.state.project_selection, expected[..=index], "{view}: clicks append in order");
+                assert_selection_badges(&mut d, &expected[..=index]);
             }
             {
                 let prefs = &mut d.app().session.prefs.project_panel.view;
@@ -1256,9 +1266,11 @@ fn imported_click_order_survives_sort_view_changes_and_a_nonfirst_drag_anchor() 
             d.exec("project.view.set", json!({"view": view}));
             d.frames(3);
             assert_eq!(d.app().session.state.project_selection, expected, "{view}: sorting and view changes keep selection order");
+            assert_selection_badges(&mut d, &expected);
             let before = d.app().session.project.clone();
             let history = d.app().session.history.undo.len();
             let to = start_imported_drag(&mut d, expected[2], change_selection);
+            assert_selection_badges(&mut d, &expected);
             let preview = d.rect("timeline.projectDropPreview");
             let session = &d.app().session;
             let seconds = 4.0 * session.prefs.timeline.still_duration(session.sequence_rate()).seconds();
@@ -1306,6 +1318,7 @@ fn imported_bulk_selections_keep_their_recorded_order_on_drop() {
             };
             d.frames(2);
             assert_eq!(d.app().session.state.project_selection, expected, "{view}: {gesture}");
+            assert_selection_badges(&mut d, &expected);
             {
                 let prefs = &mut d.app().session.prefs.project_panel.view;
                 prefs.sort.descending = true;
@@ -1323,15 +1336,222 @@ fn imported_bulk_selections_keep_their_recorded_order_on_drop() {
     d.key("Shift+Up");
     let expected: Vec<_> = visible.into_iter().rev().collect();
     assert_eq!(d.app().session.state.project_selection, expected, "keyboard range retains its anchor-first order");
+    assert_selection_badges(&mut d, &expected);
     let names: Vec<_> = expected.iter().map(|id| d.app().session.project.item(*id).unwrap().name.clone()).collect();
     drag_imported_selection(&mut d, expected[1], false);
     assert_eq!(placed_imports(&mut d).into_iter().map(|c| c.0).collect::<Vec<_>>(), names);
 }
 
 #[test]
+fn selection_badges_renumber_on_deselect_and_append_on_reselect() {
+    for view in ["list", "icon", "freeform"] {
+        let (mut d, _files, selected) = imported_drag_driver(view);
+        assert_selection_badges(&mut d, &selected);
+        let item_rects: Vec<_> = selected.iter().map(|id| d.rect(&format!("project.item.{}", id.0))).collect();
+        let names: Vec<_> = selected.iter().map(|id| d.rect(&format!("project.item.{}.name", id.0))).collect();
+        let badge = format!("project.item.{}.selectionOrder", selected[1].0);
+        // The painted badge is deliberately the pointer target: it must not intercept the click.
+        d.ok("ui.click", json!({"id": badge, "modifiers": {"command": true}}));
+        d.frames(2);
+        assert!(!d.has(&badge));
+        assert_selection_badges(&mut d, &[selected[0], selected[2]]);
+        d.ok("ui.click", json!({"id": format!("project.item.{}", selected[1].0), "modifiers": {"command": true}}));
+        let expected = [selected[0], selected[2], selected[1]];
+        assert_selection_badges(&mut d, &expected);
+        for (index, id) in selected.iter().enumerate() {
+            assert_eq!(d.rect(&format!("project.item.{}", id.0)), item_rects[index], "selection must not move the card/row");
+            assert_eq!(d.rect(&format!("project.item.{}.name", id.0)), names[index], "selection must not move the name");
+        }
+        let expected_names: Vec<_> = expected.iter().map(|id| d.app().session.project.item(*id).unwrap().name.clone()).collect();
+        let from = format!("project.item.{}.selectionOrder", expected[1].0);
+        let [tx, _, _, _] = d.rect("panel.Timeline");
+        let [_, ty, _, th] = d.rect("timeline.track.V1.target");
+        let x = tx + d.app().ui.timeline.header_w + 50.0;
+        d.ok("ui.drag", json!({"from": {"id": from}, "to": {"x": x, "y": ty + th / 2.0}, "steps": 16}));
+        d.frames(3);
+        assert_eq!(
+            placed_imports(&mut d).into_iter().map(|c| c.0).collect::<Vec<_>>(),
+            expected_names,
+            "{view}: dragging a nonfirst badge uses its displayed order"
+        );
+    }
+}
+
+#[test]
+fn selection_badges_keep_hidden_positions_and_do_not_count_bins() {
+    for view in ["list", "icon", "freeform"] {
+        let (mut d, _files, selected) = imported_drag_driver(view);
+        let parent = d.app().ui.project_panel.bin.unwrap();
+        let bin = d.exec("file.newBin", json!({"name": "Organization", "parent": parent}))["bin"].as_u64().unwrap();
+        d.exec("project.select", json!({"items": [selected[2].0, bin, selected[0].0, selected[1].0]}));
+        let expected = [selected[2], selected[0], selected[1]];
+        assert_selection_badges(&mut d, &expected);
+        assert!(!d.has(&format!("project.item.{bin}.selectionOrder")));
+        let name = d.app().session.project.item(selected[1]).unwrap().name.clone();
+        d.app().ui.project_search = name;
+        d.frames(3);
+        assert!(!d.has(&format!("project.item.{}", selected[2].0)));
+        assert_eq!(d.label(&format!("project.item.{}.selectionOrder", selected[1].0)), "3", "hidden selections keep their positions");
+        d.app().ui.project_search.clear();
+        assert_selection_badges(&mut d, &expected);
+        let to = start_imported_drag(&mut d, expected[1], false);
+        d.key("Escape");
+        project_drag_pointer(&mut d, to, Some(false));
+        assert_selection_badges(&mut d, &expected);
+        assert!(placed_imports(&mut d).is_empty());
+    }
+}
+
+#[test]
+fn selection_badges_fit_double_digits_and_expose_accessible_order() {
+    for view in ["list", "icon", "freeform"] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (1..=12).map(|i| dir.path().join(format!("Clip {i:02}.png"))).collect();
+        for (index, path) in paths.iter().enumerate() {
+            image::RgbaImage::from_fn(96, 54, |x, y| image::Rgba([30 + index as u8 * 12, 50 + x as u8, 80 + y as u8, 255])).save(path).unwrap();
+        }
+        let mut d = Driver::with(Session::default());
+        d.exec("file.import", json!({"paths": paths}));
+        d.app().session.prefs.project_panel.freeform.card_size = 80.0;
+        d.exec("project.view.set", json!({"view": view, "iconSize": 80, "fontSize": "extraLarge"}));
+        d.ok("ui.set", json!({"focused": "Project"}));
+        d.ok("ui.menu.invoke", json!({"id": "window.maximizeFrame"}));
+        d.harness.set_size(egui::vec2(1100.0, 800.0));
+        d.frames(3);
+        let selected: Vec<_> = [4, 1, 5, 2, 12, 3, 11, 6, 10, 7, 9, 8]
+            .iter()
+            .map(|i| d.app().session.project.items.values().find(|item| item.name == format!("Clip {i:02}.png")).unwrap().id)
+            .collect();
+        for (index, id) in selected.iter().enumerate() {
+            d.ok("ui.click", json!({"id": format!("project.item.{}", id.0), "modifiers": {"command": index > 0}}));
+            d.frames(2);
+        }
+        assert_selection_badges(&mut d, &selected);
+        for (index, id) in selected.iter().enumerate() {
+            let rect = |[x, y, w, h]: [f32; 4]| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+            let badge = rect(d.rect(&format!("project.item.{}.selectionOrder", id.0)));
+            let text = rect(d.rect(&format!("project.item.{}.selectionOrder.text", id.0)));
+            let item = rect(d.rect(&format!("project.item.{}", id.0)));
+            let name_rect = rect(d.rect(&format!("project.item.{}.name", id.0)));
+            assert!(item.contains_rect(badge), "{view}: badge stays in the item");
+            assert!(badge.shrink(1.0).contains_rect(text), "{view}: digits fit the pill");
+            assert!(!badge.intersects(name_rect), "{view}: badge cannot cover the clip name");
+            assert!(name_rect.width() >= 44.0, "{view}: compact footer retains room for a filename prefix");
+            let name = d.app().session.project.item(*id).unwrap().name.clone();
+            let node = d.harness.get_by_label(&name).accesskit_node();
+            assert_eq!(node.description(), Some(format!("Selection order: {} of 12", index + 1)));
+            assert_eq!(node.is_selected(), Some(true));
+            assert_eq!(node.toggled(), None);
+        }
+        if d.snapshots.is_some() {
+            let image = d.harness.render().expect("headless badge render");
+            let [x, y, w, h] = d.rect(&format!("project.item.{}.selectionOrder", selected[11].0));
+            let scale = image.width() as f32 / 1100.0;
+            let color = egui::Color32::from_rgb(0x2f, 0x6b, 0xdf);
+            let crop = image::imageops::crop_imm(&image, (x * scale) as u32, (y * scale) as u32, (w * scale) as u32, (h * scale) as u32).to_image();
+            assert!(crop.pixels().filter(|p| p.0[..3] == [color.r(), color.g(), color.b()]).count() > 30, "blue fill rendered");
+            assert!(crop.pixels().filter(|p| p[0] > 230 && p[1] > 230 && p[2] > 230).count() > 5, "white digits rendered");
+            d.snapshot(&format!("project-selection-order-badges-{view}"), None);
+        }
+    }
+    let luminance = |color: egui::Color32| {
+        let linear = |v: u8| {
+            let s = f64::from(v) / 255.0;
+            if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    };
+    let blue = egui::Color32::from_rgb(0x2f, 0x6b, 0xdf);
+    assert!(1.05 / (luminance(blue) + 0.05) >= 4.5, "white badge text contrast");
+}
+
+#[test]
+fn selection_badges_keep_small_card_status_and_custom_accents_readable() {
+    for view in ["list", "icon", "freeform"] {
+        let (mut d, _files, selected) = imported_drag_driver(view);
+        d.app().session.prefs.project_panel.freeform.card_size = 48.0;
+        d.exec("project.view.set", json!({"view": view, "iconSize": 48, "fontSize": "extraLarge"}));
+        let id = selected[1];
+        if let filmcraft_project::ItemKind::Media(m) = &mut std::sync::Arc::make_mut(&mut d.app().session.project).item_mut(id).unwrap().kind {
+            m.offline = true;
+            m.proxy = Some(m.media.clone());
+        }
+        if view == "freeform" {
+            d.exec("project.freeform.stack", json!({"items": [id.0, selected[2].0]}));
+        }
+        d.frames(3);
+        d.app().ui.language = filmcraft_ui_egui::i18n::Language::De;
+        d.app().tokens = d.app().tokens.with_appearance(Some([255, 255, 255]), false);
+        d.frames(3);
+        assert_eq!(d.app().tokens.accent, egui::Color32::WHITE);
+        let rect = |[x, y, w, h]: [f32; 4]| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+        let badge = rect(d.rect(&format!("project.item.{}.selectionOrder", id.0)));
+        assert!(rect(d.rect(&format!("project.item.{}", id.0))).contains_rect(badge));
+        if view != "list" {
+            for suffix in ["proxy", "offline"] {
+                assert!(!badge.intersects(rect(d.rect(&format!("project.item.{}.{suffix}", id.0)))), "{view}: {suffix}");
+            }
+        }
+        if view == "freeform" {
+            assert!(!badge.intersects(rect(d.rect(&format!("project.stack.{}", id.0)))));
+        }
+        let name = d.app().session.project.item(id).unwrap().name.clone();
+        let node = d.harness.get_by_label(&name).accesskit_node();
+        assert_eq!(node.description(), Some("Auswahlreihenfolge: 2 von 3".into()));
+        assert_eq!(node.is_selected(), Some(true));
+        assert_eq!(node.toggled(), None);
+        if d.snapshots.is_some() {
+            let image = d.harness.render().expect("small card headless render");
+            let scale = image.width() as f32 / 1600.0;
+            let crop = image::imageops::crop_imm(
+                &image,
+                (badge.min.x * scale) as u32,
+                (badge.min.y * scale) as u32,
+                (badge.width() * scale) as u32,
+                (badge.height() * scale) as u32,
+            )
+            .to_image();
+            assert!(crop.pixels().filter(|p| p.0[..3] == [0x2f, 0x6b, 0xdf]).count() > 30, "blue fill survives a white accent");
+            d.snapshot(&format!("project-selection-badges-small-status-{view}"), None);
+        }
+        d.ok("ui.click", json!({"id": format!("project.item.{}.selectionOrder", id.0), "modifiers": {"command": true}}));
+        d.frames(3);
+        let node = d.harness.get_by_label(&name).accesskit_node();
+        assert_eq!(node.is_selected(), Some(false));
+        assert_eq!(node.toggled(), None);
+        assert_ne!(node.description().as_deref(), Some("Auswahlreihenfolge: 2 von 3"));
+    }
+}
+
+#[test]
+fn selection_badges_preserve_saved_freeform_card_spacing() {
+    for size in [48.0_f32, 128.0] {
+        let (mut d, _files, selected) = imported_drag_driver("freeform");
+        for (index, id) in selected.iter().enumerate() {
+            std::sync::Arc::make_mut(&mut d.app().session.project)
+                .item_mut(*id)
+                .unwrap()
+                .metadata
+                .insert(FREEFORM_POS.into(), format!("12,{},{}", 12.0 + index as f32 * (size * 9.0 / 16.0 + 44.0), size));
+        }
+        let before = d.app().session.project.clone();
+        d.ok("ui.set", json!({"focused": "Project"}));
+        d.ok("ui.menu.invoke", json!({"id": "window.maximizeFrame"}));
+        d.frames(3);
+        for pair in selected.windows(2) {
+            let [_, y, _, h] = d.rect(&format!("project.item.{}.name", pair[0].0));
+            let [_, next_y, _, _] = d.rect(&format!("project.item.{}.selected", pair[1].0));
+            assert!(y + h <= next_y, "{size}: saved card footer must remain clear of the next card");
+        }
+        assert_eq!(d.app().session.project, before, "drawing preserves saved arrangements");
+    }
+}
+
+#[test]
 fn imported_select_all_drag_places_all_media_in_view_order() {
     for view in ["list", "icon", "freeform"] {
         let (mut d, _files, selected) = imported_drag_driver(view);
+        assert_selection_badges(&mut d, &selected);
         let before = d.app().session.project.clone();
         let history = d.app().session.history.undo.len();
         drag_imported_selection(&mut d, selected[0], false);
